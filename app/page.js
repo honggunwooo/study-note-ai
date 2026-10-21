@@ -10,6 +10,12 @@ export default function Home() {
   const [message, setMessage] = useState('');
   const [notes, setNotes] = useState([]);
   const [loadingNotes, setLoadingNotes] = useState(true);
+  const [quizLoadingId, setQuizLoadingId] = useState(null);
+  const [quizError, setQuizError] = useState('');
+  const [quizErrorNoteId, setQuizErrorNoteId] = useState(null);
+  const [activeQuiz, setActiveQuiz] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [showResults, setShowResults] = useState(false);
 
   // 화면이 열릴 때 지금까지의 기록을 불러오기
   useEffect(() => {
@@ -92,6 +98,36 @@ export default function Home() {
     loadNotes(); // 분석 결과까지 반영해서 목록 새로고침
   }
 
+  async function createQuiz(noteId) {
+    setQuizLoadingId(noteId);
+    setQuizError('');
+    setQuizErrorNoteId(null);
+    setActiveQuiz(null);
+    setAnswers({});
+    setShowResults(false);
+
+    try {
+      const response = await fetch('/api/quiz', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ noteId }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.error || '퀴즈를 만들지 못했어요.');
+      setActiveQuiz({ noteId, questions: data.questions });
+    } catch (error) {
+      setQuizError(error.message);
+      setQuizErrorNoteId(noteId);
+    } finally {
+      setQuizLoadingId(null);
+    }
+  }
+
+  function submitQuiz() {
+    if (!activeQuiz || Object.keys(answers).length !== activeQuiz.questions.length) return;
+    setShowResults(true);
+  }
+
   return (
     <main style={{ maxWidth: '600px', margin: '0 auto', padding: '2rem', fontFamily: 'sans-serif' }}>
       <h1>Hello, 학습노트! 📚</h1>
@@ -143,6 +179,51 @@ export default function Home() {
             <>
               <p><strong>📝 요약</strong>: {note.note_summaries[0].summary}</p>
               <p><strong>🔑 키워드</strong>: {note.note_summaries[0].keywords?.join(', ')}</p>
+              <button
+                onClick={() => createQuiz(note.id)}
+                disabled={quizLoadingId !== null}
+                style={{ marginTop: '0.5rem' }}
+              >
+                {quizLoadingId === note.id ? '퀴즈 만드는 중...' : '🧠 복습 퀴즈 풀기'}
+              </button>
+              {quizError && quizErrorNoteId === note.id && quizLoadingId === null && (
+                <p role="alert" style={{ color: '#b42318' }}>{quizError}</p>
+              )}
+              {activeQuiz?.noteId === note.id && (
+                <section style={{ marginTop: '1rem', padding: '1rem', background: '#f7f8fa', borderRadius: '8px' }}>
+                  <h3>🧠 복습 퀴즈</h3>
+                  {activeQuiz.questions.map((question, questionIndex) => (
+                    <fieldset key={`${questionIndex}-${question.question}`} style={{ margin: '1rem 0', padding: '0.75rem', border: '1px solid #ddd', borderRadius: '6px' }}>
+                      <legend><strong>{questionIndex + 1}. {question.question}</strong></legend>
+                      {question.options.map((option, optionIndex) => (
+                        <label key={optionIndex} style={{ display: 'block', margin: '0.5rem 0' }}>
+                          <input
+                            type="radio"
+                            name={`question-${note.id}-${questionIndex}`}
+                            value={optionIndex}
+                            checked={answers[questionIndex] === optionIndex}
+                            disabled={showResults}
+                            onChange={() => setAnswers((current) => ({ ...current, [questionIndex]: optionIndex }))}
+                          />{' '}{option}
+                        </label>
+                      ))}
+                      {showResults && (
+                        <p style={{ color: answers[questionIndex] === question.answerIndex ? '#16803c' : '#b42318' }}>
+                          {answers[questionIndex] === question.answerIndex ? '정답이에요! ' : `정답: ${question.options[question.answerIndex]}. `}
+                          {question.explanation}
+                        </p>
+                      )}
+                    </fieldset>
+                  ))}
+                  {!showResults ? (
+                    <button onClick={submitQuiz} disabled={Object.keys(answers).length !== activeQuiz.questions.length}>
+                      채점하기
+                    </button>
+                  ) : (
+                    <p><strong>점수: {activeQuiz.questions.reduce((score, question, index) => score + (answers[index] === question.answerIndex ? 1 : 0), 0)} / {activeQuiz.questions.length}</strong></p>
+                  )}
+                </section>
+              )}
             </>
           )}
         </div>
