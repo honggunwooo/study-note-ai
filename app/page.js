@@ -34,6 +34,8 @@ export default function Home() {
   const [tagInput, setTagInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [retryingId, setRetryingId] = useState(null);
+  const [refreshingPendingId, setRefreshingPendingId] = useState(null);
+  const [pendingRefreshMessage, setPendingRefreshMessage] = useState({});
   const [message, setMessage] = useState('');
   const [notes, setNotes] = useState([]);
   const [attempts, setAttempts] = useState([]);
@@ -181,6 +183,41 @@ export default function Home() {
     } finally {
       setRetryingId(null);
       await loadNotes();
+    }
+  }
+
+  async function refreshPendingNote(noteId) {
+    setRefreshingPendingId(noteId);
+    setPendingRefreshMessage((current) => ({ ...current, [noteId]: '최신 상태를 확인하고 있어요…' }));
+    try {
+      const { data: latestNote, error } = await supabase
+        .from('notes')
+        .select('status, created_at')
+        .eq('id', noteId)
+        .single();
+      if (error) throw error;
+      if (latestNote.status !== 'pending') {
+        setPendingRefreshMessage((current) => ({
+          ...current,
+          [noteId]: latestNote.status === 'done' ? '분석이 완료됐어요.' : '분석이 실패했어요. 아래에서 다시 시도할 수 있어요.',
+        }));
+        return;
+      }
+
+      const pendingForMs = Date.now() - new Date(latestNote.created_at).getTime();
+      if (pendingForMs < 90_000) {
+        setPendingRefreshMessage((current) => ({ ...current, [noteId]: '아직 분석 중이에요. 잠시 후 다시 확인해주세요.' }));
+        return;
+      }
+
+      setPendingRefreshMessage((current) => ({ ...current, [noteId]: '오래 대기해 분석을 다시 시작하고 있어요…' }));
+      await analyzeNote(noteId);
+      setPendingRefreshMessage((current) => ({ ...current, [noteId]: '분석이 완료됐어요.' }));
+    } catch (error) {
+      setPendingRefreshMessage((current) => ({ ...current, [noteId]: `새로고침하지 못했어요: ${error.message}` }));
+    } finally {
+      await loadNotes();
+      setRefreshingPendingId(null);
     }
   }
 
@@ -393,7 +430,7 @@ export default function Home() {
                 </div> : <div className="note-title-row"><div><h3 className="note-title">{note.title || '제목 없는 노트'}</h3><div className="note-subject">{note.subject || '과목 미지정'}</div></div><button className="text-button" onClick={() => beginMetadataEdit(note)}>편집</button></div>}
                 {note.tags?.length > 0 && <div className="keywords metadata-tags">{note.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>}
 
-                {note.status === 'failed' ? <div className="failed-box"><p>{note.error_message || '사진을 분석하지 못했어요. 다시 시도해주세요.'}</p><button className="retry-button" onClick={() => retryAnalysis(note.id)} disabled={retryingId !== null}>{retryingId === note.id ? <><span className="spinner small" />다시 분석 중</> : '다시 분석하기 →'}</button></div> : note.status === 'pending' ? <div className="pending-box"><span className="spinner small" />사진에서 내용을 읽고 있어요.</div> : <>
+                {note.status === 'failed' ? <div className="failed-box"><p>{note.error_message || '사진을 분석하지 못했어요. 다시 시도해주세요.'}</p><button className="retry-button" onClick={() => retryAnalysis(note.id)} disabled={retryingId !== null}>{retryingId === note.id ? <><span className="spinner small" />다시 분석 중</> : '다시 분석하기 →'}</button></div> : note.status === 'pending' ? <div className="pending-box"><div><span className="spinner small" />{pendingRefreshMessage[note.id] || '사진에서 내용을 읽고 있어요.'}</div><button className="pending-refresh" onClick={() => refreshPendingNote(note.id)} disabled={refreshingPendingId !== null}>{refreshingPendingId === note.id ? '확인 중…' : '상태 새로고침'}</button></div> : <>
                   <div className="summary-heading"><h4>핵심 요약</h4><button className="text-button" onClick={() => beginSummaryEdit(note.id, summary)}>요약 편집</button></div>
                   {summaryEditingId === note.id ? <div className="edit-fields summary-editor"><label>요약<textarea rows="5" value={summaryDraft} onChange={(event) => setSummaryDraft(event.target.value)} /></label><label>핵심 키워드<input value={keywordsDraft} onChange={(event) => setKeywordsDraft(event.target.value)} placeholder="쉼표로 구분" /></label><div className="edit-actions"><button className="text-button" onClick={() => setSummaryEditingId(null)}>취소</button><button className="small-action" onClick={() => saveSummary(note)}>요약 저장</button></div></div> : <><p className="summary-text">{summary?.summary || '요약이 없습니다.'}</p><div className="keywords">{(summary?.keywords || []).map((word) => <span key={word}>#{word}</span>)}</div></>}
 

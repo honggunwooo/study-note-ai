@@ -141,7 +141,10 @@ button { color: inherit; }
 .failed-box, .pending-box { margin-top: 13px; padding: 11px; border-radius: 9px; background: #fff7f3; }
 .failed-box p { margin: 0 0 9px; color: #934d3e; font-size: 11px; line-height: 1.6; }
 .retry-button:disabled { opacity: .6; cursor: wait; }
-.pending-box { display: flex; align-items: center; background: #f4f7f4; color: #78877d; font-size: 11px; }
+.pending-box { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: #f4f7f4; color: #78877d; font-size: 11px; }
+.pending-box > div { display: flex; min-width: 0; align-items: flex-start; }
+.pending-refresh { flex: 0 0 auto; padding: 7px 8px; border: 1px solid #cbded3; border-radius: 7px; background: white; color: #26745d; cursor: pointer; font-size: 10px; }
+.pending-refresh:disabled { opacity: .55; cursor: wait; }
 .attempt-history { margin-top: 12px; border-top: 1px solid #edf1ed; padding-top: 10px; }
 .attempt-history summary { color: #4d7863; cursor: pointer; font-size: 10px; font-weight: 600; }
 .attempt-list { display: grid; gap: 8px; margin-top: 9px; }
