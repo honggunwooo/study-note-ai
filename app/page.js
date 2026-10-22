@@ -35,6 +35,7 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [retryingId, setRetryingId] = useState(null);
   const [refreshingPendingId, setRefreshingPendingId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
   const [pendingRefreshMessage, setPendingRefreshMessage] = useState({});
   const [message, setMessage] = useState('');
   const [notes, setNotes] = useState([]);
@@ -219,6 +220,45 @@ export default function Home() {
       await loadNotes();
       setRefreshingPendingId(null);
     }
+  }
+
+  async function deleteNote(note) {
+    const noteName = note.title || '제목 없는 노트';
+    if (!window.confirm(`“${noteName}” 노트와 요약, 사진을 삭제할까요? 이 작업은 되돌릴 수 없습니다.`)) return;
+
+    setDeletingId(note.id);
+    try {
+      const { error: summaryError } = await supabase.from('note_summaries').delete().eq('note_id', note.id);
+      if (summaryError) throw summaryError;
+
+      const { error: noteError } = await supabase.from('notes').delete().eq('id', note.id);
+      if (noteError) throw noteError;
+
+      setNotes((current) => current.filter((item) => item.id !== note.id));
+      if (activeQuiz?.noteId === note.id) setActiveQuiz(null);
+      const remainingAttempts = attempts.filter((attempt) => attempt.note_id !== note.id);
+      setAttempts(remainingAttempts);
+      try { window.localStorage.setItem(ATTEMPTS_STORAGE_KEY, JSON.stringify(remainingAttempts)); }
+      catch { setMessage('노트는 삭제했지만 이 브라우저의 퀴즈 기록을 갱신하지 못했어요.'); }
+
+      let objectPath = null;
+      try {
+        const pathName = new URL(note.image_url).pathname;
+        const bucketMarker = '/storage/v1/object/public/note-images/';
+        const bucketIndex = pathName.indexOf(bucketMarker);
+        objectPath = bucketIndex >= 0 ? decodeURIComponent(pathName.slice(bucketIndex + bucketMarker.length)) : null;
+      } catch { /* The database record is already deleted; report that the image path was unavailable. */ }
+      if (objectPath) {
+        const { error: imageError } = await supabase.storage.from('note-images').remove([objectPath]);
+        if (imageError) setMessage('노트와 요약은 삭제했지만 사진 파일은 삭제하지 못했어요.');
+        else setMessage('노트와 사진을 삭제했어요.');
+      } else {
+        setMessage('노트와 요약을 삭제했어요. 사진 경로를 찾지 못해 파일은 남아 있을 수 있어요.');
+      }
+
+    } catch (error) {
+      setMessage(`노트를 삭제하지 못했어요: ${error.message}`);
+    } finally { setDeletingId(null); }
   }
 
   async function createQuiz(noteId) {
@@ -427,7 +467,7 @@ export default function Home() {
                   <label>과목<input value={metadataDraft.subject} onChange={(event) => setMetadataDraft({ ...metadataDraft, subject: event.target.value })} /></label>
                   <label>태그<input value={metadataDraft.tags} onChange={(event) => setMetadataDraft({ ...metadataDraft, tags: event.target.value })} placeholder="쉼표로 구분" /></label>
                   <div className="edit-actions"><button className="text-button" onClick={() => setMetadataEditingId(null)}>취소</button><button className="small-action" onClick={() => saveMetadata(note.id)}>정보 저장</button></div>
-                </div> : <div className="note-title-row"><div><h3 className="note-title">{note.title || '제목 없는 노트'}</h3><div className="note-subject">{note.subject || '과목 미지정'}</div></div><button className="text-button" onClick={() => beginMetadataEdit(note)}>편집</button></div>}
+                </div> : <div className="note-title-row"><div><h3 className="note-title">{note.title || '제목 없는 노트'}</h3><div className="note-subject">{note.subject || '과목 미지정'}</div></div><div className="note-actions"><button className="text-button" onClick={() => beginMetadataEdit(note)}>편집</button><button className="delete-button" onClick={() => deleteNote(note)} disabled={deletingId !== null || retryingId === note.id || refreshingPendingId === note.id} aria-label={`${note.title || '노트'} 삭제`}>{deletingId === note.id ? '삭제 중…' : '삭제'}</button></div></div>}
                 {note.tags?.length > 0 && <div className="keywords metadata-tags">{note.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>}
 
                 {note.status === 'failed' ? <div className="failed-box"><p>{note.error_message || '사진을 분석하지 못했어요. 다시 시도해주세요.'}</p><button className="retry-button" onClick={() => retryAnalysis(note.id)} disabled={retryingId !== null}>{retryingId === note.id ? <><span className="spinner small" />다시 분석 중</> : '다시 분석하기 →'}</button></div> : note.status === 'pending' ? <div className="pending-box"><div><span className="spinner small" />{pendingRefreshMessage[note.id] || '사진에서 내용을 읽고 있어요.'}</div><button className="pending-refresh" onClick={() => refreshPendingNote(note.id)} disabled={refreshingPendingId !== null}>{refreshingPendingId === note.id ? '확인 중…' : '상태 새로고침'}</button></div> : <>
