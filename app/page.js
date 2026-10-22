@@ -10,12 +10,25 @@ const filters = [
   ['failed', '실패'],
 ];
 const ATTEMPTS_STORAGE_KEY = 'study-note-ai:quiz-attempts';
+const imageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+function mergeImageFiles(existing, incoming) {
+  const known = new Set(existing.map((file) => `${file.name}-${file.size}-${file.lastModified}`));
+  return [...existing, ...Array.from(incoming).filter((file) => {
+    const key = `${file.name}-${file.size}-${file.lastModified}`;
+    if (!imageTypes.includes(file.type) || known.has(key)) return false;
+    known.add(key);
+    return true;
+  })];
+}
 
 const formatDate = (value, options = { year: 'numeric', month: 'long', day: 'numeric' }) =>
   value ? new Date(value).toLocaleDateString('ko-KR', options) : '날짜 없음';
 
 export default function Home() {
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('');
   const [tagInput, setTagInput] = useState('');
@@ -62,6 +75,25 @@ export default function Home() {
     }
   }, []);
 
+  useEffect(() => {
+    function handlePaste(event) {
+      const pastedImages = Array.from(event.clipboardData?.items || [])
+        .filter((item) => imageTypes.includes(item.type))
+        .map((item, index) => {
+          const blob = item.getAsFile();
+          if (!blob) return null;
+          const extension = blob.type.split('/')[1] === 'jpeg' ? 'jpg' : blob.type.split('/')[1];
+          return new File([blob], `clipboard-${Date.now()}-${index}.${extension}`, { type: blob.type, lastModified: Date.now() });
+        }).filter(Boolean);
+      if (!pastedImages.length) return;
+      event.preventDefault();
+      setFiles((current) => mergeImageFiles(current, pastedImages));
+      setMessage(`${pastedImages.length}장의 클립보드 이미지를 대기열에 추가했어요.`);
+    }
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, []);
+
   const latestAttempts = useMemo(() => attempts.reduce((result, attempt) => {
     if (!result[attempt.note_id]) result[attempt.note_id] = [];
     result[attempt.note_id].push(attempt);
@@ -93,35 +125,50 @@ export default function Home() {
   }
 
   async function handleUpload() {
-    if (!file || busy) return;
+    if (!files.length || busy) return;
     setBusy(true);
-    setMessage('사진을 올리고 내용을 정리하고 있어요…');
-    try {
-      const fileName = `${Date.now()}-${file.name.replace(/[^\w.-]/g, '_')}`;
-      const { error: uploadError } = await supabase.storage.from('note-images').upload(fileName, file);
-      if (uploadError) throw uploadError;
-      const { data: urlData } = supabase.storage.from('note-images').getPublicUrl(fileName);
-      const tags = tagInput.split(',').map((tag) => tag.trim()).filter(Boolean);
-      const { data: note, error: insertError } = await supabase.from('notes').insert({
-        image_url: urlData.publicUrl,
-        status: 'pending',
-        title: title.trim() || file.name.replace(/\.[^.]+$/, ''),
-        subject: subject.trim(),
-        tags,
-      }).select().single();
-      if (insertError) throw insertError;
-      await loadNotes();
-      await analyzeNote(note.id);
-      setMessage('노트 정리가 끝났어요. 복습 퀴즈도 풀어보세요!');
-      setFile(null);
-      setTitle(''); setSubject(''); setTagInput('');
-      const input = document.getElementById('note-file');
-      if (input) input.value = '';
-      await loadNotes();
-    } catch (error) {
-      setMessage(`처리하지 못했어요: ${error.message}`);
-      await loadNotes();
-    } finally { setBusy(false); }
+    const queue = [...files];
+    const failures = [];
+    let completed = 0;
+    for (let index = 0; index < queue.length; index += 1) {
+      const file = queue[index];
+      try {
+        setUploadProgress({ completed, total: queue.length, name: file.name, phase: '사진 업로드 중' });
+        const fileName = `${Date.now()}-${index}-${file.name.replace(/[^\w.-]/g, '_')}`;
+        const { error: uploadError } = await supabase.storage.from('note-images').upload(fileName, file);
+        if (uploadError) throw uploadError;
+        const { data: urlData } = supabase.storage.from('note-images').getPublicUrl(fileName);
+        const tags = tagInput.split(',').map((tag) => tag.trim()).filter(Boolean);
+        const noteTitle = title.trim()
+          ? (queue.length > 1 ? `${title.trim()} ${index + 1}` : title.trim())
+          : file.name.replace(/\.[^.]+$/, '');
+        const { data: note, error: insertError } = await supabase.from('notes').insert({
+          image_url: urlData.publicUrl,
+          status: 'pending',
+          title: noteTitle,
+          subject: subject.trim(),
+          tags,
+        }).select().single();
+        if (insertError) throw insertError;
+        setUploadProgress({ completed, total: queue.length, name: file.name, phase: 'AI가 노트를 분석 중' });
+        await analyzeNote(note.id);
+      } catch (error) {
+        failures.push(`${file.name}: ${error.message}`);
+      }
+      completed += 1;
+      setUploadProgress({ completed, total: queue.length, name: file.name, phase: '처리 완료' });
+    }
+    const successful = queue.length - failures.length;
+    setMessage(failures.length
+      ? `${successful}장 완료, ${failures.length}장 실패: ${failures.slice(0, 2).join(' · ')}`
+      : `${successful}장의 노트 정리가 끝났어요. 복습 퀴즈도 풀어보세요!`);
+    setFiles([]);
+    setTitle(''); setSubject(''); setTagInput('');
+    const input = document.getElementById('note-file');
+    if (input) input.value = '';
+    setBusy(false);
+    setUploadProgress(null);
+    await loadNotes();
   }
 
   async function retryAnalysis(noteId) {
@@ -274,14 +321,35 @@ export default function Home() {
             <label>과목<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="예: 생명과학" /></label>
             <label>태그<input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="쉼표로 구분 · 세포, 시험 범위" /></label>
           </div>
-          <label className={`dropzone ${file ? 'has-file' : ''}`} htmlFor="note-file">
+          <label
+            className={`dropzone ${files.length ? 'has-file' : ''} ${isDragging ? 'is-dragging' : ''}`}
+            htmlFor="note-file"
+            onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }}
+            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setIsDragging(false); }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setIsDragging(false);
+              const incoming = Array.from(event.dataTransfer.files || []);
+              setFiles((current) => mergeImageFiles(current, incoming));
+              if (incoming.length) setMessage('사진을 업로드 대기열에 추가했어요.');
+            }}
+          >
             <span className="file-icon">▧</span>
-            <strong>{file ? file.name : '노트 사진을 선택해주세요'}</strong>
-            <span>{file ? '다른 사진을 선택하려면 클릭하세요' : 'JPG, PNG, WEBP · 사진 파일을 클릭해 업로드'}</span>
-            <input id="note-file" type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+            <strong>{isDragging ? '여기에 사진을 놓으세요' : files.length ? `${files.length}장의 사진이 대기 중` : '사진을 끌어놓거나 선택해주세요'}</strong>
+            <span>여러 장 선택 가능 · 스크린샷은 Ctrl+V로 붙여넣기 · JPG, PNG, WEBP</span>
+            <input id="note-file" type="file" accept="image/jpeg,image/png,image/webp" multiple disabled={busy} onChange={(event) => {
+              const incoming = Array.from(event.target.files || []);
+              setFiles((current) => mergeImageFiles(current, incoming));
+              if (incoming.length) setMessage(`${incoming.length}장을 업로드 대기열에 추가했어요.`);
+              event.target.value = '';
+            }} />
           </label>
-          {file && <div className="file-meta"><span>선택한 사진</span><button className="text-button" onClick={() => { setFile(null); document.getElementById('note-file').value = ''; }}>삭제</button></div>}
-          <button className="primary-button" onClick={handleUpload} disabled={!file || busy}>{busy ? <><span className="spinner" />AI가 노트를 정리하고 있어요</> : <>사진 올리고 요약하기 <span aria-hidden="true">→</span></>}</button>
+          {files.length > 0 && <div className="queue-list" aria-label="업로드 대기열">
+            {files.map((queuedFile, index) => <div className="queue-item" key={`${queuedFile.name}-${queuedFile.size}-${queuedFile.lastModified}`}><span className="queue-number">{String(index + 1).padStart(2, '0')}</span><span className="queue-name" title={queuedFile.name}>{queuedFile.name}</span><span className="queue-size">{(queuedFile.size / 1024 / 1024).toFixed(1)} MB</span><button type="button" aria-label={`${queuedFile.name} 제거`} disabled={busy} onClick={() => setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>)}
+            {!busy && files.length > 1 && <button type="button" className="queue-clear" onClick={() => setFiles([])}>대기열 비우기</button>}
+          </div>}
+          {uploadProgress && <div className="upload-progress" role="status"><div><span>{uploadProgress.phase}</span><strong>{uploadProgress.completed}/{uploadProgress.total}</strong></div><progress value={uploadProgress.completed} max={uploadProgress.total} /><small>{uploadProgress.name}</small></div>}
+          <button className="primary-button" onClick={handleUpload} disabled={!files.length || busy}>{busy ? <><span className="spinner" />{files.length}장 순서대로 처리 중</> : <>사진 {files.length ? `${files.length}장` : ''} 올리고 요약하기 <span aria-hidden="true">→</span></>}</button>
           {message && <p className="status-message" role="status">{message}</p>}
         </section>
 
