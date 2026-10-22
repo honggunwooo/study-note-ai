@@ -1,3 +1,5 @@
+import './globals.css';
+
 export const metadata = {
   title: "학습노트 AI",
   description: "공부한 내용을 자동으로 정리해주는 서비스",

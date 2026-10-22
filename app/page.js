@@ -3,36 +3,94 @@
 import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabaseClient';
 
+const filters = [
+  ['all', '전체'],
+  ['due', '복습할 노트'],
+  ['done', '완료'],
+  ['failed', '실패'],
+];
+const ATTEMPTS_STORAGE_KEY = 'study-note-ai:quiz-attempts';
+
+const formatDate = (value, options = { year: 'numeric', month: 'long', day: 'numeric' }) =>
+  value ? new Date(value).toLocaleDateString('ko-KR', options) : '날짜 없음';
+
 export default function Home() {
   const [file, setFile] = useState(null);
+  const [title, setTitle] = useState('');
+  const [subject, setSubject] = useState('');
+  const [tagInput, setTagInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [retryingId, setRetryingId] = useState(null);
   const [message, setMessage] = useState('');
   const [notes, setNotes] = useState([]);
+  const [attempts, setAttempts] = useState([]);
   const [loadingNotes, setLoadingNotes] = useState(true);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [quizLoadingId, setQuizLoadingId] = useState(null);
+  const [quizSaving, setQuizSaving] = useState(false);
   const [quizError, setQuizError] = useState('');
+  const [quizSaveError, setQuizSaveError] = useState('');
   const [activeQuiz, setActiveQuiz] = useState(null);
   const [answers, setAnswers] = useState({});
   const [showResults, setShowResults] = useState(false);
+  const [attemptResult, setAttemptResult] = useState(null);
+  const [metadataEditingId, setMetadataEditingId] = useState(null);
+  const [metadataDraft, setMetadataDraft] = useState({ title: '', subject: '', tags: '' });
+  const [summaryEditingId, setSummaryEditingId] = useState(null);
+  const [summaryDraft, setSummaryDraft] = useState('');
+  const [keywordsDraft, setKeywordsDraft] = useState('');
 
   async function loadNotes() {
     setLoadingNotes(true);
-    const { data, error } = await supabase.from('notes').select('*, note_summaries(summary, keywords)').order('created_at', { ascending: false });
+    const { data, error } = await supabase.from('notes').select('*, note_summaries(id, summary, keywords)').order('created_at', { ascending: false });
     if (!error) setNotes(data || []);
     else setMessage(`기록을 불러오지 못했어요: ${error.message}`);
     setLoadingNotes(false);
   }
 
-  useEffect(() => { loadNotes(); }, []);
+  useEffect(() => {
+    loadNotes();
+    try {
+      const savedAttempts = window.localStorage.getItem(ATTEMPTS_STORAGE_KEY);
+      if (savedAttempts) {
+        const parsedAttempts = JSON.parse(savedAttempts);
+        if (Array.isArray(parsedAttempts)) setAttempts(parsedAttempts);
+      }
+    } catch {
+      setQuizSaveError('이 브라우저에서 저장된 퀴즈 기록을 읽지 못했어요.');
+    }
+  }, []);
+
+  const latestAttempts = useMemo(() => attempts.reduce((result, attempt) => {
+    if (!result[attempt.note_id]) result[attempt.note_id] = [];
+    result[attempt.note_id].push(attempt);
+    return result;
+  }, {}), [attempts]);
+
+  const dueNotes = useMemo(() => notes.filter((note) =>
+    note.status === 'done' && latestAttempts[note.id]?.[0]?.next_review_at && new Date(latestAttempts[note.id][0].next_review_at).getTime() <= Date.now()
+  ), [notes, latestAttempts]);
 
   const filteredNotes = useMemo(() => notes.filter((note) => {
     const summary = note.note_summaries?.[0];
-    const haystack = `${summary?.summary || ''} ${(summary?.keywords || []).join(' ')}`.toLowerCase();
-    return (filter === 'all' || note.status === filter) && haystack.includes(query.trim().toLowerCase());
-  }), [notes, query, filter]);
+    const haystack = [note.title, note.subject, ...(note.tags || []), summary?.summary, ...(summary?.keywords || [])]
+      .filter(Boolean).join(' ').toLowerCase();
+    const matchesFilter = filter === 'all' ||
+      (filter === 'due' ? dueNotes.some((dueNote) => dueNote.id === note.id) : note.status === filter);
+    return matchesFilter && haystack.includes(query.trim().toLowerCase());
+  }), [notes, query, filter, dueNotes]);
+
   const completedCount = notes.filter((note) => note.status === 'done').length;
+  async function analyzeNote(noteId) {
+    const response = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ noteId }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || '분석에 실패했어요.');
+  }
 
   async function handleUpload() {
     if (!file || busy) return;
@@ -43,14 +101,20 @@ export default function Home() {
       const { error: uploadError } = await supabase.storage.from('note-images').upload(fileName, file);
       if (uploadError) throw uploadError;
       const { data: urlData } = supabase.storage.from('note-images').getPublicUrl(fileName);
-      const { data: note, error: insertError } = await supabase.from('notes').insert({ image_url: urlData.publicUrl, status: 'pending' }).select().single();
+      const tags = tagInput.split(',').map((tag) => tag.trim()).filter(Boolean);
+      const { data: note, error: insertError } = await supabase.from('notes').insert({
+        image_url: urlData.publicUrl,
+        status: 'pending',
+        title: title.trim() || file.name.replace(/\.[^.]+$/, ''),
+        subject: subject.trim(),
+        tags,
+      }).select().single();
       if (insertError) throw insertError;
       await loadNotes();
-      const response = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ noteId: note.id, imageUrl: urlData.publicUrl }) });
-      const result = await response.json();
-      if (!response.ok || !result.success) throw new Error(result.error || '분석에 실패했어요.');
+      await analyzeNote(note.id);
       setMessage('노트 정리가 끝났어요. 복습 퀴즈도 풀어보세요!');
       setFile(null);
+      setTitle(''); setSubject(''); setTagInput('');
       const input = document.getElementById('note-file');
       if (input) input.value = '';
       await loadNotes();
@@ -60,10 +124,26 @@ export default function Home() {
     } finally { setBusy(false); }
   }
 
-  async function createQuiz(noteId) {
-    setQuizLoadingId(noteId); setQuizError(''); setActiveQuiz(null); setAnswers({}); setShowResults(false);
+  async function retryAnalysis(noteId) {
+    setRetryingId(noteId); setMessage('노트를 다시 분석하고 있어요…');
     try {
-      const response = await fetch('/api/quiz', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ noteId }) });
+      await analyzeNote(noteId);
+      setMessage('노트 분석을 다시 완료했어요.');
+    } catch (error) {
+      setMessage(`다시 분석하지 못했어요: ${error.message}`);
+    } finally {
+      setRetryingId(null);
+      await loadNotes();
+    }
+  }
+
+  async function createQuiz(noteId) {
+    setQuizLoadingId(noteId); setQuizError(''); setQuizSaveError('');
+    setActiveQuiz(null); setAnswers({}); setShowResults(false); setAttemptResult(null);
+    try {
+      const response = await fetch('/api/quiz', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ noteId }),
+      });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || '퀴즈를 만들지 못했어요.');
       setActiveQuiz({ noteId, questions: data.questions });
@@ -71,45 +151,201 @@ export default function Home() {
     finally { setQuizLoadingId(null); }
   }
 
+  async function submitQuiz() {
+    if (!activeQuiz || Object.keys(answers).length !== activeQuiz.questions.length || quizSaving) return;
+    setShowResults(true);
+    setQuizSaving(true);
+    setQuizSaveError('');
+    try {
+      const response = await fetch('/api/quiz/attempt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ noteId: activeQuiz.noteId, questions: activeQuiz.questions, answers }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.error || '점수를 저장하지 못했어요.');
+      setAttemptResult(data);
+      const savedAttempt = {
+        id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+        note_id: activeQuiz.noteId,
+        score: data.score,
+        total: data.total,
+        questions: activeQuiz.questions,
+        answers,
+        wrong_questions: data.wrongQuestions,
+        next_review_at: data.nextReviewAt,
+        created_at: new Date().toISOString(),
+      };
+      const nextAttempts = [savedAttempt, ...attempts];
+      try {
+        window.localStorage.setItem(ATTEMPTS_STORAGE_KEY, JSON.stringify(nextAttempts));
+        setAttempts(nextAttempts);
+      } catch {
+        setQuizSaveError('점수는 확인했지만 브라우저 저장 공간에 기록을 저장하지 못했어요.');
+      }
+    } catch (error) {
+      setQuizSaveError(`${error.message} 답은 확인했지만 기록은 저장하지 못했어요.`);
+    } finally { setQuizSaving(false); }
+  }
+
+  function beginMetadataEdit(note) {
+    setMetadataEditingId(note.id);
+    setMetadataDraft({ title: note.title || '', subject: note.subject || '', tags: (note.tags || []).join(', ') });
+  }
+
+  async function saveMetadata(noteId) {
+    const { error } = await supabase.from('notes').update({
+      title: metadataDraft.title.trim(),
+      subject: metadataDraft.subject.trim(),
+      tags: metadataDraft.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
+    }).eq('id', noteId);
+    if (error) { setMessage(`노트 정보를 저장하지 못했어요: ${error.message}`); return; }
+    setMetadataEditingId(null);
+    await loadNotes();
+  }
+
+  function beginSummaryEdit(noteId, summary) {
+    setSummaryEditingId(noteId);
+    setSummaryDraft(summary?.summary || '');
+    setKeywordsDraft((summary?.keywords || []).join(', '));
+  }
+
+  async function saveSummary(note) {
+    const summary = note.note_summaries?.[0];
+    const values = { summary: summaryDraft.trim(), keywords: keywordsDraft.split(',').map((word) => word.trim()).filter(Boolean) };
+    const query = summary
+      ? supabase.from('note_summaries').update(values).eq('id', summary.id)
+      : supabase.from('note_summaries').insert({ ...values, note_id: note.id });
+    const { error } = await query;
+    if (error) { setMessage(`요약을 저장하지 못했어요: ${error.message}`); return; }
+    setSummaryEditingId(null);
+    await loadNotes();
+  }
+
+  function exportMarkdown(note) {
+    const summary = note.note_summaries?.[0];
+    const history = latestAttempts[note.id] || [];
+    const content = [
+      `# ${note.title || '학습 노트'}`,
+      note.subject ? `과목: ${note.subject}` : '',
+      `날짜: ${formatDate(note.created_at)}`,
+      note.tags?.length ? `태그: ${note.tags.map((tag) => `#${tag}`).join(' ')}` : '',
+      '', '## 요약', summary?.summary || '아직 요약이 없습니다.', '',
+      '## 핵심 키워드', (summary?.keywords || []).map((word) => `- ${word}`).join('\n') || '- 없음', '',
+      '## 퀴즈 기록', history.length ? history.slice(0, 10).map((attempt) =>
+        `- ${formatDate(attempt.created_at)}: ${attempt.score}/${attempt.total}점 · 오답 ${attempt.wrong_questions?.length || 0}개`
+      ).join('\n') : '- 아직 퀴즈 기록이 없습니다.',
+      '', '## 오답 복습', history.flatMap((attempt) => attempt.wrong_questions || []).slice(0, 20).map((item) =>
+        `- ${item.question}\n  - 내 답: ${item.selectedAnswer || '미응답'} / 정답: ${item.correctAnswer}\n  - ${item.explanation}`
+      ).join('\n') || '- 오답이 없습니다.',
+    ].filter((line) => line !== undefined).join('\n');
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${(note.title || '학습노트').replace(/[\\/:*?"<>|]/g, '-')}.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   const score = activeQuiz?.questions.reduce((sum, question, index) => sum + (answers[index] === question.answerIndex ? 1 : 0), 0) || 0;
 
   return (
     <main className="page-shell">
-      <header className="topbar"><a className="brand" href="#top"><span className="brand-mark">N</span> 노트온</a><span className="topbar-note">나만의 AI 학습 공간</span></header>
+      <header className="topbar">
+        <a className="brand" href="#top"><span className="brand-mark">N</span> 노트온</a>
+        <span className="topbar-note">나만의 AI 학습 공간</span>
+      </header>
+
       <div id="top" className="content">
         <section className="welcome">
-          <div><span className="eyebrow">STUDY, MADE SIMPLE</span><h1>배운 내용을 모으고,<br /><span>내 것으로 만들어보세요.</span></h1><p>노트 사진 한 장이면 AI가 핵심을 정리하고 복습까지 도와드려요.</p></div>
+          <div>
+            <span className="eyebrow">STUDY, MADE SIMPLE</span>
+            <h1>배운 내용을 모으고,<br /><span>내 것으로 만들어보세요.</span></h1>
+            <p>노트 사진 한 장이면 AI가 핵심을 정리하고 복습까지 도와드려요.</p>
+          </div>
           <div className="welcome-art" aria-hidden="true"><div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" /><div className="art-card">✦<small>오늘의 배움</small><b>한 장씩 차곡차곡</b></div><span className="art-sparkle">✧</span></div>
         </section>
 
         <section className="upload-card" aria-labelledby="upload-title">
           <div className="section-heading"><div><span className="eyebrow">NEW NOTE</span><h2 id="upload-title">오늘 공부한 내용을 추가해요</h2></div><span className="upload-icon">↑</span></div>
-          <label className={`dropzone ${file ? 'has-file' : ''}`} htmlFor="note-file"><span className="file-icon">▧</span><strong>{file ? file.name : '노트 사진을 선택해주세요'}</strong><span>{file ? '다른 사진을 선택하려면 클릭하세요' : 'JPG, PNG, WEBP · 사진 파일을 클릭해 업로드'}</span><input id="note-file" type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
+          <div className="metadata-fields">
+            <label>노트 제목<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="예: 세포의 구조" /></label>
+            <label>과목<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="예: 생명과학" /></label>
+            <label>태그<input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="쉼표로 구분 · 세포, 시험 범위" /></label>
+          </div>
+          <label className={`dropzone ${file ? 'has-file' : ''}`} htmlFor="note-file">
+            <span className="file-icon">▧</span>
+            <strong>{file ? file.name : '노트 사진을 선택해주세요'}</strong>
+            <span>{file ? '다른 사진을 선택하려면 클릭하세요' : 'JPG, PNG, WEBP · 사진 파일을 클릭해 업로드'}</span>
+            <input id="note-file" type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+          </label>
           {file && <div className="file-meta"><span>선택한 사진</span><button className="text-button" onClick={() => { setFile(null); document.getElementById('note-file').value = ''; }}>삭제</button></div>}
           <button className="primary-button" onClick={handleUpload} disabled={!file || busy}>{busy ? <><span className="spinner" />AI가 노트를 정리하고 있어요</> : <>사진 올리고 요약하기 <span aria-hidden="true">→</span></>}</button>
           {message && <p className="status-message" role="status">{message}</p>}
         </section>
 
         <section className="library" aria-labelledby="library-title">
-          <div className="library-heading"><div><span className="eyebrow">YOUR LIBRARY</span><h2 id="library-title">내 학습 노트 <span className="count-badge">{notes.length}</span></h2></div><div className="stats"><span><b>{completedCount}</b> 정리 완료</span><span><b>{notes.length - completedCount}</b> 처리 중</span></div></div>
-          <div className="toolbar"><label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="요약과 키워드 검색" aria-label="노트 검색" /></label><div className="filter-tabs" aria-label="노트 상태 필터"><button className={filter === 'all' ? 'selected' : ''} onClick={() => setFilter('all')}>전체</button><button className={filter === 'done' ? 'selected' : ''} onClick={() => setFilter('done')}>완료</button><button className={filter === 'pending' ? 'selected' : ''} onClick={() => setFilter('pending')}>분석 중</button></div></div>
-          {loadingNotes ? <div className="empty-state"><span className="spinner" />노트를 불러오고 있어요</div> : filteredNotes.length === 0 ? <div className="empty-state"><span className="empty-icon">✎</span><strong>{notes.length ? '검색 결과가 없어요' : '아직 저장된 노트가 없어요'}</strong><span>{notes.length ? '다른 단어로 검색하거나 필터를 바꿔보세요.' : '첫 번째 노트 사진을 올려 학습 기록을 시작해보세요.'}</span></div> : <div className="notes-grid">{filteredNotes.map((note) => {
-            const summary = note.note_summaries?.[0];
-            return <article className="note-card" key={note.id}><div className="note-top"><img src={note.image_url} alt="학습 노트 사진" /><div className="note-meta"><span className={`status-pill ${note.status === 'done' ? 'done' : 'pending'}`}><i />{note.status === 'done' ? '정리 완료' : '분석 대기 중'}</span><time>{new Date(note.created_at).toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' })}</time></div></div>
-              {note.status === 'done' && summary ? <><h3>핵심 요약</h3><p className="summary-text">{summary.summary}</p><div className="keywords">{(summary.keywords || []).map((word) => <span key={word}>#{word}</span>)}</div><button className="quiz-button" onClick={() => createQuiz(note.id)} disabled={quizLoadingId !== null}>{quizLoadingId === note.id ? <><span className="spinner small" />문제를 준비하고 있어요</> : <>✦ 이 노트로 복습하기 <span>→</span></>}</button>{quizError && quizLoadingId === null && !activeQuiz && <p className="error-message" role="alert">{quizError}</p>}
-                {activeQuiz?.noteId === note.id && <section className="quiz-panel"><div className="quiz-title"><div><span className="eyebrow">QUICK REVIEW</span><h3>복습 퀴즈</h3></div><button className="text-button" onClick={() => { setActiveQuiz(null); setShowResults(false); }}>닫기</button></div>{activeQuiz.questions.map((question, index) => <fieldset className="question" key={index}><legend><b>{String(index + 1).padStart(2, '0')}</b>{question.question}</legend><div className="options">{question.options.map((option, optionIndex) => <label className={showResults && optionIndex === question.answerIndex ? 'correct' : showResults && answers[index] === optionIndex ? 'incorrect' : ''} key={optionIndex}><input type="radio" name={`question-${note.id}-${index}`} checked={answers[index] === optionIndex} disabled={showResults} onChange={() => setAnswers((current) => ({ ...current, [index]: optionIndex }))} />{option}</label>)}</div>{showResults && <p className="explanation">{answers[index] === question.answerIndex ? '정답이에요! ' : `정답: ${question.options[question.answerIndex]}. `}{question.explanation}</p>}</fieldset>)}{showResults ? <p className="score">이번 점수 <strong>{score} / {activeQuiz.questions.length}</strong></p> : <button className="primary-button quiz-submit" onClick={() => setShowResults(true)} disabled={Object.keys(answers).length !== activeQuiz.questions.length}>답안 확인하기 →</button>}</section>}
-              </> : <p className="pending-copy">사진에서 내용을 읽고 있어요. 잠시 후 새로고침해 확인해주세요.</p>}</article>;
-          })}</div>}
+          <div className="library-heading">
+            <div><span className="eyebrow">YOUR LIBRARY</span><h2 id="library-title">내 학습 노트 <span className="count-badge">{notes.length}</span></h2></div>
+            <div className="stats"><span><b>{completedCount}</b> 정리 완료</span><span><b>{notes.length - completedCount}</b> 처리 중</span></div>
+          </div>
+
+          {dueNotes.length > 0 && <button className="review-banner" onClick={() => setFilter('due')}><span className="review-banner-icon">↻</span><span><strong>오늘 복습할 노트가 {dueNotes.length}개 있어요</strong><small>퀴즈 결과에 맞춰 복습 시점을 정했어요.</small></span><b>복습하기 →</b></button>}
+
+          <div className="toolbar">
+            <label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목, 과목, 요약, 태그 검색" aria-label="노트 검색" /></label>
+            <button className="print-button" onClick={() => window.print()}>PDF로 저장 / 인쇄</button>
+            <div className="filter-tabs" aria-label="노트 필터">{filters.map(([value, label]) => <button key={value} className={filter === value ? 'selected' : ''} onClick={() => setFilter(value)}>{label}{value === 'due' && dueNotes.length > 0 ? ` ${dueNotes.length}` : ''}</button>)}</div>
+          </div>
+
+          {quizSaveError && !activeQuiz && <p className="setup-hint" role="status">{quizSaveError}</p>}
+          {loadingNotes ? <div className="empty-state"><span className="spinner" />노트를 불러오고 있어요</div> : filteredNotes.length === 0 ? <div className="empty-state"><span className="empty-icon">✎</span><strong>{notes.length ? '검색 결과가 없어요' : '아직 저장된 노트가 없어요'}</strong><span>{notes.length ? '다른 단어로 검색하거나 필터를 바꿔보세요.' : '첫 번째 노트 사진을 올려 학습 기록을 시작해보세요.'}</span></div> : <div className="notes-grid">
+            {filteredNotes.map((note) => {
+              const summary = note.note_summaries?.[0];
+              const noteAttempts = latestAttempts[note.id] || [];
+              const latestAttempt = noteAttempts[0];
+              const isDue = dueNotes.some((item) => item.id === note.id);
+              return <article className="note-card" key={note.id}>
+                <div className="note-top">
+                  <img src={note.image_url} alt={`${note.title || '학습'} 노트 사진`} />
+                  <div className="note-meta">
+                    <span className={`status-pill ${note.status === 'done' ? 'done' : note.status === 'failed' ? 'failed' : 'pending'}`}><i />{note.status === 'done' ? '정리 완료' : note.status === 'failed' ? '분석 실패' : '분석 중'}</span>
+                    <time>{formatDate(note.created_at)}</time>
+                    {latestAttempt && <span className="last-score">최근 퀴즈 {latestAttempt.score}/{latestAttempt.total}</span>}
+                  </div>
+                  <button className="icon-button" title="Markdown으로 내보내기" aria-label={`${note.title || '노트'} Markdown 다운로드`} onClick={() => exportMarkdown(note)}>↓</button>
+                </div>
+
+                {metadataEditingId === note.id ? <div className="edit-fields">
+                  <label>제목<input value={metadataDraft.title} onChange={(event) => setMetadataDraft({ ...metadataDraft, title: event.target.value })} /></label>
+                  <label>과목<input value={metadataDraft.subject} onChange={(event) => setMetadataDraft({ ...metadataDraft, subject: event.target.value })} /></label>
+                  <label>태그<input value={metadataDraft.tags} onChange={(event) => setMetadataDraft({ ...metadataDraft, tags: event.target.value })} placeholder="쉼표로 구분" /></label>
+                  <div className="edit-actions"><button className="text-button" onClick={() => setMetadataEditingId(null)}>취소</button><button className="small-action" onClick={() => saveMetadata(note.id)}>정보 저장</button></div>
+                </div> : <div className="note-title-row"><div><h3 className="note-title">{note.title || '제목 없는 노트'}</h3><div className="note-subject">{note.subject || '과목 미지정'}</div></div><button className="text-button" onClick={() => beginMetadataEdit(note)}>편집</button></div>}
+                {note.tags?.length > 0 && <div className="keywords metadata-tags">{note.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>}
+
+                {note.status === 'failed' ? <div className="failed-box"><p>{note.error_message || '사진을 분석하지 못했어요. 다시 시도해주세요.'}</p><button className="retry-button" onClick={() => retryAnalysis(note.id)} disabled={retryingId !== null}>{retryingId === note.id ? <><span className="spinner small" />다시 분석 중</> : '다시 분석하기 →'}</button></div> : note.status === 'pending' ? <div className="pending-box"><span className="spinner small" />사진에서 내용을 읽고 있어요.</div> : <>
+                  <div className="summary-heading"><h4>핵심 요약</h4><button className="text-button" onClick={() => beginSummaryEdit(note.id, summary)}>요약 편집</button></div>
+                  {summaryEditingId === note.id ? <div className="edit-fields summary-editor"><label>요약<textarea rows="5" value={summaryDraft} onChange={(event) => setSummaryDraft(event.target.value)} /></label><label>핵심 키워드<input value={keywordsDraft} onChange={(event) => setKeywordsDraft(event.target.value)} placeholder="쉼표로 구분" /></label><div className="edit-actions"><button className="text-button" onClick={() => setSummaryEditingId(null)}>취소</button><button className="small-action" onClick={() => saveSummary(note)}>요약 저장</button></div></div> : <><p className="summary-text">{summary?.summary || '요약이 없습니다.'}</p><div className="keywords">{(summary?.keywords || []).map((word) => <span key={word}>#{word}</span>)}</div></>}
+
+                  {latestAttempt && <div className="review-date"><span>마지막 복습 {formatDate(latestAttempt.created_at)}</span><span className={isDue ? 'due-label' : ''}>{isDue ? '오늘 복습할 차례' : `다음 복습 ${formatDate(latestAttempt.next_review_at)}`}</span></div>}
+                  <button className="quiz-button" onClick={() => createQuiz(note.id)} disabled={quizLoadingId !== null}>{quizLoadingId === note.id ? <><span className="spinner small" />문제를 준비하고 있어요</> : <>✦ 이 노트로 복습하기 <span>→</span></>}</button>
+                  {quizError && quizLoadingId === null && !activeQuiz && <p className="error-message" role="alert">{quizError}</p>}
+
+                  {noteAttempts.length > 0 && <details className="attempt-history"><summary>퀴즈 기록 {noteAttempts.length}회 · 오답 복습</summary><div className="attempt-list">{noteAttempts.slice(0, 5).map((attempt) => <div className="attempt-item" key={attempt.id}><div className="attempt-line"><strong>{attempt.score}/{attempt.total}점</strong><time>{formatDate(attempt.created_at, { month: 'short', day: 'numeric' })}</time></div>{attempt.wrong_questions?.length > 0 ? <ul>{attempt.wrong_questions.map((wrong, index) => <li key={`${attempt.id}-${index}`}><b>{wrong.question}</b><span>내 답: {wrong.selectedAnswer || '미응답'} · 정답: {wrong.correctAnswer}</span><small>{wrong.explanation}</small></li>)}</ul> : <p className="all-correct">모두 맞혔어요. 다음 복습은 {formatDate(attempt.next_review_at)}이에요.</p>}</div>)}</div></details>}
+
+                  {activeQuiz?.noteId === note.id && <section className="quiz-panel"><div className="quiz-title"><div><span className="eyebrow">QUICK REVIEW</span><h3>복습 퀴즈</h3></div><button className="text-button" onClick={() => { setActiveQuiz(null); setShowResults(false); setAttemptResult(null); }}>닫기</button></div>
+                    {activeQuiz.questions.map((question, index) => <fieldset className="question" key={index}><legend><b>{String(index + 1).padStart(2, '0')}</b>{question.question}</legend><div className="options">{question.options.map((option, optionIndex) => <label className={showResults && optionIndex === question.answerIndex ? 'correct' : showResults && answers[index] === optionIndex ? 'incorrect' : ''} key={optionIndex}><input type="radio" name={`question-${note.id}-${index}`} checked={answers[index] === optionIndex} disabled={showResults} onChange={() => setAnswers((current) => ({ ...current, [index]: optionIndex }))} />{option}</label>)}</div>{showResults && <p className="explanation">{answers[index] === question.answerIndex ? '정답이에요! ' : `정답: ${question.options[question.answerIndex]}. `}{question.explanation}</p>}</fieldset>)}
+                    {showResults ? <div className="score-result"><p>이번 점수 <strong>{attemptResult?.score ?? score} / {attemptResult?.total ?? activeQuiz.questions.length}</strong></p>{quizSaving ? <span><span className="spinner small" />점수와 오답을 저장하고 있어요</span> : attemptResult ? <span>{quizSaveError || `다음 복습일은 ${formatDate(attemptResult.nextReviewAt)}예요.`}</span> : quizSaveError ? <span className="error-message">{quizSaveError}</span> : null}</div> : <button className="primary-button quiz-submit" onClick={submitQuiz} disabled={Object.keys(answers).length !== activeQuiz.questions.length}>답안 확인하고 기록하기 →</button>}
+                  </section>}
+                </>}
+              </article>;
+            })}
+          </div>}
         </section>
         <footer className="footer">작은 기록이 쌓여 큰 배움이 됩니다 <span>✦</span></footer>
       </div>
-      <style jsx global>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap');
-        :root{--ink:#202c27;--muted:#78837d;--line:#e8ece8;--green:#2f7655;--pale:#f4f7f3;--mint:#eaf3ec}*{box-sizing:border-box}body{margin:0;background:#fafbf9;color:var(--ink);font-family:'DM Sans','Noto Sans KR',sans-serif}.page-shell{min-height:100vh;background:radial-gradient(ellipse at 87% 4%,#edf4eb 0,transparent 27%),#fafbf9}.topbar{height:70px;border-bottom:1px solid #edf0ec;display:flex;align-items:center;justify-content:space-between;padding:0 max(24px,calc((100% - 1050px)/2));background:rgba(255,255,255,.76)}.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:17px;letter-spacing:-.5px;color:var(--ink);text-decoration:none}.brand-mark{display:grid;place-items:center;background:#2f7655;color:white;width:30px;height:30px;border-radius:10px;font-size:16px}.topbar-note{font-size:12px;color:#89938c}.content{width:min(100% - 40px,920px);margin:0 auto}.welcome{padding:62px 28px 52px;display:flex;justify-content:space-between;align-items:center;min-height:260px}.eyebrow{font:700 10px 'DM Sans',sans-serif;letter-spacing:1.8px;color:#71927d}.welcome h1{font-size:36px;line-height:1.42;letter-spacing:-1.6px;margin:12px 0 10px;font-weight:800}.welcome h1 span{color:#478364}.welcome p{margin:0;color:#78837d;font-size:14px}.welcome-art{width:180px;height:160px;position:relative;display:grid;place-items:center}.art-orbit{position:absolute;border:1px solid #dae8db;border-radius:50%;width:140px;height:140px}.orbit-two{width:175px;height:105px;transform:rotate(-34deg)}.art-card{z-index:1;width:140px;height:104px;background:#fff;border:1px solid #e7ede6;border-radius:17px;box-shadow:0 12px 35px #243d2a12;padding:18px;color:#6c9a76;font-size:20px;transform:rotate(-5deg)}.art-card small,.art-card b{display:block}.art-card small{font-size:10px;color:#9ba99e;margin-top:8px}.art-card b{font-size:12px;color:#34473a;margin-top:5px}.art-sparkle{position:absolute;right:4px;top:15px;color:#c59a50;font-size:27px}.upload-card{background:white;border:1px solid var(--line);border-radius:20px;padding:27px 30px 22px;box-shadow:0 8px 28px #19302206}.section-heading{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.section-heading h2,.library-heading h2{font-size:19px;letter-spacing:-.6px;margin:5px 0 0}.upload-icon{width:38px;height:38px;border-radius:12px;background:var(--mint);color:#468160;display:grid;place-items:center;font-size:21px}.dropzone{height:140px;border:1.5px dashed #d5e1d6;border-radius:14px;background:#fafcf9;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:7px;cursor:pointer;transition:.2s}.dropzone:hover,.dropzone.has-file{border-color:#78a787;background:#f5faf5}.file-icon{font-size:23px;color:#699477}.dropzone strong{font-size:13px;font-weight:600}.dropzone>span:last-of-type{font-size:11px;color:#939d96}.dropzone input{display:none}.file-meta{display:flex;justify-content:space-between;font-size:11px;color:#818c84;padding:10px 2px 0}.text-button{border:0;background:none;color:#698c74;font-size:12px;cursor:pointer}.primary-button{height:45px;width:100%;border:0;border-radius:11px;background:#347552;color:white;font:600 13px inherit;cursor:pointer;margin-top:15px;transition:.18s}.primary-button:hover:not(:disabled){background:#286345;transform:translateY(-1px)}.primary-button:disabled{opacity:.52;cursor:not-allowed}.status-message{margin:12px 0 0;font-size:12px;color:#66816c;text-align:center}.library{margin-top:47px}.library-heading{display:flex;justify-content:space-between;align-items:end}.library-heading h2{font-size:22px}.count-badge{display:inline-grid;place-items:center;vertical-align:3px;margin-left:5px;min-width:23px;height:22px;padding:0 6px;border-radius:7px;background:#edf4ee;color:#558165;font-size:11px}.stats{display:flex;gap:16px;color:#8b968e;font-size:11px}.stats b{color:#42634d;font-size:13px;margin-right:3px}.toolbar{display:flex;justify-content:space-between;gap:14px;align-items:center;margin:20px 0 17px}.search-box{height:38px;display:flex;gap:8px;align-items:center;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:white;flex:1;max-width:360px;color:#849087}.search-box span{font-size:22px}.search-box input{border:0;outline:0;background:none;width:100%;font:12px inherit;color:var(--ink)}.filter-tabs{display:flex;gap:4px;background:#f0f2ef;padding:4px;border-radius:10px}.filter-tabs button{border:0;background:none;padding:7px 12px;border-radius:7px;font-size:11px;color:#7e8981;cursor:pointer}.filter-tabs button.selected{background:white;color:#3b684b;box-shadow:0 1px 3px #1b34200d}.notes-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.note-card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:17px;min-width:0;box-shadow:0 3px 12px #19302204}.note-top{display:flex;gap:12px;align-items:center;margin-bottom:15px}.note-top img{width:60px;height:60px;border-radius:10px;object-fit:cover;background:#f0f2ef}.note-meta{display:flex;flex-direction:column;gap:8px}.note-meta time{font-size:10px;color:#9aa39c}.status-pill{font-size:10px;display:flex;align-items:center;gap:6px}.status-pill i{width:6px;height:6px;border-radius:50%;background:#d0a34a}.status-pill.done{color:#49805e}.status-pill.done i{background:#64a277}.note-card h3{font-size:12px;margin:0 0 6px}.summary-text{font-size:12px;line-height:1.75;color:#606e64;margin:0;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.keywords{display:flex;gap:6px;flex-wrap:wrap;margin-top:11px}.keywords span{font-size:10px;padding:5px 7px;border-radius:6px;background:#f1f6f1;color:#5b8265}.quiz-button{border:1px solid #dce9de;background:#f8fbf8;color:#39724f;width:100%;height:36px;border-radius:9px;margin-top:14px;font-size:11px;font-weight:600;cursor:pointer}.quiz-button:hover:not(:disabled){background:#edf5ee}.quiz-button:disabled{opacity:.65;cursor:wait}.quiz-button>span:last-child{float:right;margin-right:8px}.pending-copy{padding:10px;background:#fafaf7;border-radius:8px;font-size:12px;color:#8c8a70}.empty-state{min-height:185px;background:white;border:1px solid var(--line);border-radius:15px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:#909a92;font-size:12px}.empty-state strong{color:#536157;font-size:14px}.empty-icon{font-size:24px;color:#78a184}.footer{text-align:center;color:#a1aaa3;font-size:11px;padding:45px 0 28px}.footer span{color:#78a184;margin-left:4px}.spinner{display:inline-block;width:13px;height:13px;border:2px solid #c6d5c8;border-top-color:#45805b;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:7px}.spinner.small{width:11px;height:11px}@keyframes spin{to{transform:rotate(360deg)}}.error-message{font-size:11px;color:#ae4d43}.quiz-panel{margin-top:14px;padding:14px;background:#f8faf7;border:1px solid #e6ede5;border-radius:12px}.quiz-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.quiz-title h3{font-size:15px;margin:4px 0}.question{border:0;border-top:1px solid #e7ece6;padding:12px 0;margin:0}.question legend{display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:1.6}.question legend b{color:#659073;font-size:10px;padding-top:2px}.options{display:grid;gap:5px;margin-top:8px}.options label{display:flex;gap:7px;align-items:center;border:1px solid #e9ede8;border-radius:7px;padding:7px;font-size:11px;cursor:pointer}.options label.correct{border-color:#7bb18a;background:#eef7ef}.options label.incorrect{border-color:#dda49c;background:#fff2ef}.options input{accent-color:#347552}.explanation{font-size:10px;line-height:1.6;color:#69806d;margin:8px 0 0}.score{font-size:12px;text-align:center;color:#617268}.score strong{font-size:16px;color:#347552;margin-left:5px}.quiz-submit{height:38px;margin-top:8px;font-size:11px}.quiz-submit:disabled{opacity:.45}@media(max-width:650px){.topbar{height:60px;padding:0 20px}.content{width:min(100% - 28px,920px)}.welcome{padding:43px 6px 35px;min-height:200px}.welcome h1{font-size:27px;letter-spacing:-1px}.welcome p{font-size:12px;max-width:300px;line-height:1.7}.welcome-art{width:115px;transform:scale(.8);margin-right:-15px}.upload-card{padding:21px 17px 17px;border-radius:16px}.section-heading h2{font-size:16px}.dropzone{height:125px}.library{margin-top:38px}.library-heading h2{font-size:19px}.stats{gap:8px;flex-direction:column;align-items:flex-end}.toolbar{align-items:stretch;flex-direction:column}.search-box{max-width:none}.filter-tabs{width:max-content}.notes-grid{grid-template-columns:1fr}.note-card{padding:15px}.footer{padding-top:32px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-        .topbar{position:sticky;top:0;z-index:10;backdrop-filter:blur(16px);box-shadow:0 2px 14px #26382b05}.content{padding-bottom:18px}.welcome{position:relative;overflow:hidden;margin:10px -28px 0;padding-left:56px;padding-right:56px;border-radius:0 0 26px 26px;background:linear-gradient(115deg,#f2f7f0 0%,#f8faf7 56%,#edf5ed 100%)}.welcome:after{content:'';position:absolute;width:230px;height:230px;border-radius:50%;right:7%;top:-155px;border:1px solid #e0eadf;box-shadow:0 0 0 25px #ffffff38,0 0 0 50px #ffffff2a;pointer-events:none}.welcome>div:first-child{position:relative;z-index:1}.welcome-art{z-index:1}.upload-card{position:relative;margin-top:-7px}.section-heading h2,.library-heading h2{line-height:1.45}.dropzone:focus-within{outline:3px solid #34755226;outline-offset:3px}.dropzone strong{max-width:90%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.primary-button{font-family:inherit;font-weight:600;letter-spacing:.1px}.primary-button:focus-visible,.quiz-button:focus-visible,.filter-tabs button:focus-visible,.text-button:focus-visible{outline:3px solid #34755245;outline-offset:2px}.search-box:focus-within{border-color:#8eae95;box-shadow:0 0 0 3px #34755210}.search-box input{font:12px 'DM Sans','Noto Sans KR',sans-serif}.note-card{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}.note-card:hover{transform:translateY(-2px);border-color:#dce7dc;box-shadow:0 10px 25px #1930220a}.note-top img{border:1px solid #eff1ed}.status-pill{width:max-content;padding:5px 8px;border-radius:20px;background:#f6f5ed}.status-pill.done{background:#eff6ef}.quiz-button{transition:background .18s,border-color .18s}.quiz-button:hover:not(:disabled){border-color:#bbd4c0}.empty-state{padding:24px;text-align:center}.footer{border-top:1px solid #edf0ec;max-width:520px;margin:10px auto 0}.question legend{width:100%}.options label{transition:background .15s,border-color .15s}.options label:hover:not(.correct):not(.incorrect){background:#fff;border-color:#d6e3d7}@media(max-width:650px){.welcome{margin:0 -8px;padding:37px 18px 34px;border-radius:0 0 20px 20px}.welcome:after{right:-60px;top:-160px}.upload-card{margin-top:0}.library-heading{align-items:flex-start}.stats{padding-top:8px}.note-card:hover{transform:none}.topbar-note{font-size:11px}}@media(min-width:1000px){.content{width:min(100% - 64px,900px)}.welcome{padding-top:67px;padding-bottom:57px}.upload-card{padding:30px 34px 24px}.notes-grid{gap:17px}.note-card{padding:19px}}
-        .page-shell{overflow:hidden}.content{position:relative}.welcome{isolation:isolate}.welcome:before{content:'NOTE  /  REVIEW  /  REPEAT';position:absolute;left:56px;bottom:19px;font:600 9px 'DM Sans',sans-serif;letter-spacing:1.7px;color:#a3b5a4;opacity:.8}.welcome-art .art-card{transition:transform .25s ease,box-shadow .25s ease}.welcome-art:hover .art-card{transform:rotate(-2deg) translateY(-3px);box-shadow:0 17px 38px #243d2a18}.upload-card{box-shadow:0 10px 34px #243d2a09}.dropzone{position:relative;overflow:hidden}.dropzone:after{content:'';position:absolute;inset:0;background:linear-gradient(110deg,transparent 25%,#ffffff8a 50%,transparent 75%);transform:translateX(-120%);transition:transform .6s ease;pointer-events:none}.dropzone:hover:after{transform:translateX(120%)}.library-heading{padding-bottom:2px}.note-card{position:relative;overflow:hidden}.note-card:before{content:'';position:absolute;top:0;left:0;width:3px;height:48px;border-radius:0 0 4px 0;background:#dcebdd}.note-card:has(.status-pill.pending):before{background:#eadfbe}.note-card h3{letter-spacing:.1px}.keywords span{border:1px solid #e9f0e8}.quiz-panel{box-shadow:inset 0 1px 2px #223b2604}.options label:has(input:checked){border-color:#a9c5ad;background:#f3f8f3}.primary-button,.quiz-button{letter-spacing:.1px}.primary-button:active:not(:disabled),.quiz-button:active:not(:disabled){transform:translateY(1px)}@media(max-width:650px){.welcome:before{left:18px;bottom:12px;font-size:8px}.welcome{padding-bottom:45px}.welcome-art{opacity:.8}.library-heading{gap:10px}.stats{font-size:10px}.note-card:before{height:38px}}@media(min-width:651px) and (max-width:900px){.welcome{margin-left:-10px;margin-right:-10px;padding-left:34px;padding-right:34px}.welcome:before{left:34px}}
-        :root{--ink:#172c2b;--muted:#657c77;--line:#dce9e4;--green:#087f68;--pale:#eff8f4;--mint:#dff4eb}.page-shell{background:radial-gradient(ellipse at 84% 5%,#d8f0e7 0,transparent 30%),radial-gradient(ellipse at 4% 42%,#fff0db 0,transparent 23%),#f8fbf8}.topbar{border-color:#e1ece6;background:rgba(250,253,250,.84)}.brand-mark{background:linear-gradient(145deg,#0c9074,#08735f);box-shadow:0 5px 12px #087f6828}.welcome{background:linear-gradient(115deg,#e5f6ed 0%,#f4f8ed 55%,#fff0dd 100%)}.welcome:after{border-color:#c8e8d9;box-shadow:0 0 0 25px #d5eddf42,0 0 0 50px #fff8e83b}.welcome h1 span{color:#087f68}.welcome .eyebrow,.eyebrow{color:#18866d}.welcome p{color:#5e7670}.welcome:before{color:#79968a}.art-orbit{border-color:#bcdcca}.art-card{border-color:#deeee2;box-shadow:0 12px 35px #15583c18;color:#138b6e}.art-card small{color:#7c9a8c}.art-card b{color:#1d3e34}.art-sparkle{color:#e5944d}.upload-card{border-color:#dce9e4;box-shadow:0 13px 38px #214d3210}.upload-icon{background:#dff4eb;color:#078068}.dropzone{border-color:#b9d9c9;background:linear-gradient(135deg,#f5fbf7,#f3faf8)}.dropzone:hover,.dropzone.has-file{border-color:#078068;background:#eaf8f1}.file-icon{color:#078068}.primary-button{background:linear-gradient(105deg,#087f68,#149879);box-shadow:0 6px 14px #087f6825}.primary-button:hover:not(:disabled){background:linear-gradient(105deg,#076c5a,#108468)}.status-message{color:#16765f}.count-badge{background:#dff4eb;color:#08745f}.stats b{color:#08745f}.search-box:focus-within{border-color:#60ae8e;box-shadow:0 0 0 3px #1498791a}.filter-tabs button.selected{color:#08745f}.note-card{border-color:#e1ebe5;box-shadow:0 4px 15px #1d493008}.note-card:before{background:#35a17b}.note-card:has(.status-pill.pending):before{background:#e69b57}.note-card:hover{border-color:#b9dcca;box-shadow:0 12px 26px #15583c12}.status-pill.done{color:#08745f;background:#e7f6ec}.status-pill.done i{background:#159773}.status-pill.pending{color:#9b6534;background:#fff3e5}.status-pill.pending i{background:#e9a153}.keywords span{background:#eaf6ef;border-color:#d8ebdc;color:#237b5d}.quiz-button{border-color:#b8dac6;background:#eff8f2;color:#08745f}.quiz-button:hover:not(:disabled){border-color:#62b08a;background:#e5f5ea}.quiz-panel{background:#f0f8f3;border-color:#d6eadb}.options label:has(input:checked){border-color:#78bd98;background:#e8f6eb}.options label.correct{border-color:#53aa78;background:#e1f4e7}.score strong{color:#087f68}.empty-icon{color:#159773}.footer span{color:#df9250}.welcome-art .art-card{box-shadow:0 12px 35px #15583c1c}@media(max-width:650px){.welcome{background:linear-gradient(145deg,#e5f6ed,#f4f8ed 65%,#fff0dd)}.page-shell{background:radial-gradient(ellipse at 90% 5%,#d8f0e7 0,transparent 28%),#f8fbf8}}
-      `}</style>
     </main>
   );
 }
